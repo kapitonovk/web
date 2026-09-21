@@ -1,46 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Выборочный, параллельный и кешируемый OCR для уже созданных BTI-дампов.
+Качественный OCR БТИ-PDF с пропуском больших листов чертежей.
 
-Вход: CSV с колонкой «путь» (как исходный список PDF).
-Ищет для каждого PDF его папку в --dump-root, созданную bti_dump_pdfs.py:
-  <dump-root>/<safe_stem>__<hash>/manifest.json
-  <dump-root>/<safe_stem>__<hash>/dump.xlsx
+Вход: CSV с колонкой «путь».
+Выход: в --dump-root/<safe_stem>__<hash>/ создаются:
+  ocr_quality/page_0001.txt   — OCR-текст страницы
+  ocr_quality/page_0001.tsv   — OCR TSV: слова + координаты + confidence
+  ocr_quality/page_0001.json  — метаданные и статус страницы
+  ocr_quality_index.csv       — постраничный кеш / индекс
+  ocr_quality_manifest.json   — сводка одного PDF
 
-Выход, добавляемый в папку конкретного PDF:
-  ocr/page_0001.txt        — OCR-текст страницы
-  ocr/page_0001.json       — метрики и статус страницы
-  ocr_index.csv            — постраничный кеш / журнал
-  ocr_manifest.json        — сводка OCR конкретного PDF
+Логика:
+  - OCR-ятся ВСЕ страницы PDF, кроме слишком больших листов.
+  - До рендера вычисляется ожидаемый размер изображения на заданном DPI.
+  - Листы выше --max-megapixels пропускаются как «чертёж / большой лист».
+  - Это единственное автоматическое исключение: нет отбора по ключевым словам,
+    нет фильтра по «плановым» словам, нет preview и нет поворотов.
+  - Для остальных листов: 350 DPI, grayscale, autocontrast и мягкий контраст.
+    Бинаризация намеренно не применяется: она может уничтожить запятые/точки
+    и тонкие цифры площадей.
+  - TXT и TSV сохраняются для каждого распознанного листа.
 
-По умолчанию OCR запускается ТОЛЬКО для PDF, чей manifest.json имеет
-"document_mode": "scan". PDF типа native и mixed будут пропущены.
+Кеширование:
+  - ok, low_text и skipped_too_large повторно не обрабатываются.
+  - --retry-failed повторяет только timeout/error.
+  - --overwrite принудительно повторяет все страницы.
+  - --force-pages "17,18" позволяет обработать конкретные большие листы,
+    игнорируя ограничение megapixels.
 
 Зависимости:
-  py -m pip install pymupdf pytesseract pillow openpyxl tqdm
+  py -m pip install pymupdf pytesseract pillow tqdm
 
-Tesseract:
-  папка tesseract должна лежать рядом со скриптом:
-    .\tesseract\tesseract.exe
-    .\tesseract\tessdata\rus.traineddata
-    .\tesseract\tessdata\eng.traineddata
+Tesseract рядом со скриптом:
+  .\tesseract\tesseract.exe
+  .\tesseract\tessdata\rus.traineddata
+  .\tesseract\tessdata\eng.traineddata
 
-Примеры:
-  # Проверка отбора страниц без OCR и без записи результата
-  py bti_ocr_selected.py --csv ocr_candidates.csv --sep ";" --dump-root bti_dumps --dry-run
-
-  # Основной быстрый массовый запуск: только scan-PDF, 3 процесса
-  py bti_ocr_selected.py --csv ocr_candidates.csv --sep ";" --dump-root bti_dumps --workers 3
-
-  # Добавить mixed-PDF
-  py bti_ocr_selected.py --csv ocr_candidates.csv --sep ";" --dump-root bti_dumps --include-mixed --workers 3
-
-  # Повторить только страницы с timeout/error
-  py bti_ocr_selected.py --csv ocr_candidates.csv --sep ";" --dump-root bti_dumps --retry-failed --workers 2
-
-  # Принудительно сделать OCR конкретных страниц, включая плановые
-  py bti_ocr_selected.py --csv one_pdf.csv --sep ";" --dump-root bti_dumps --force-pages "17,18,42" --workers 1
+Пример:
+  py bti_ocr_selected.py --csv ocr_candidates.csv --sep ";" --dump-root bti_dumps --workers 2
 """
 
 import argparse
@@ -55,12 +53,13 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+# Один OCR-процесс на один поток; параллелизм задаётся --workers.
 os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import fitz
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 
 try:
     from tqdm import tqdm
@@ -69,45 +68,12 @@ except ImportError:
         return items
 
 
-KEYWORDS_RE = re.compile(
-    r"эксплик|площад|помещен|квартир|нежил|общая\s+площад|жилая\s+площад",
-    re.IGNORECASE,
-)
-PLAN_WORDS_RE = re.compile(
-    r"поэтажн|план\s+(?:этажа|помещен)|схема|масштаб|условн(?:ые|ых)\s+обознач",
-    re.IGNORECASE,
-)
-CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
-
-DONE_STATUSES = {
-    "ok",
-    "skipped_plan_suspect",
-    "skipped_too_large",
-    "skipped_native_text",
-    "skipped_not_bad",
-    "skipped_low_text",
-}
-RETRYABLE_STATUSES = {"error", "timeout"}
 OCR_COLUMNS = [
-    "page", "status", "dpi", "megapixels", "chars", "seconds",
-    "native_chars", "plan_score", "reason", "text_file", "meta_file", "updated_at",
+    "page", "status", "dpi", "megapixels", "chars", "tsv_words", "seconds",
+    "reason", "text_file", "tsv_file", "meta_file", "updated_at",
 ]
-
-
-def norm_text(text):
-    text = (text or "").replace("\xa0", " ").replace("\u202f", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def native_is_bad(text):
-    text = norm_text(text)
-    if len(text) < 80:
-        return True
-    cid = text.casefold().count("(cid:")
-    cyr = len(CYRILLIC_RE.findall(text))
-    return cid >= 5 or cyr < max(8, len(text) // 80)
+DONE_STATUSES = {"ok", "low_text", "skipped_too_large"}
+RETRYABLE_STATUSES = {"error", "timeout"}
 
 
 def safe_name(text):
@@ -125,6 +91,13 @@ def dump_folder_for(pdf_path, dump_root):
     return dump_root / f"{safe_name(pdf_path.stem)}__{short_hash(pdf_path)}"
 
 
+def norm_text(text):
+    text = (text or "").replace("\xa0", " ").replace("\u202f", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def read_paths(csv_path, column, delimiter):
     paths, seen = [], set()
     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
@@ -132,30 +105,30 @@ def read_paths(csv_path, column, delimiter):
         if not reader.fieldnames or column not in reader.fieldnames:
             raise SystemExit(f"В CSV нет колонки «{column}». Найдены: {reader.fieldnames}")
         for row in reader:
-            raw = (row.get(column) or "").strip().strip('"')
-            if raw and raw not in seen:
-                paths.append(Path(raw))
-                seen.add(raw)
+            value = (row.get(column) or "").strip().strip('"')
+            if value and value not in seen:
+                paths.append(Path(value))
+                seen.add(value)
     return paths
 
 
 def find_tesseract(script_dir, supplied):
     if supplied:
-        candidate = Path(supplied)
-        return candidate if candidate.is_file() else None
-    for candidate in [
+        path = Path(supplied)
+        return path if path.is_file() else None
+    for path in [
         script_dir / "tesseract" / "tesseract.exe",
         script_dir / "Tesseract-OCR" / "tesseract.exe",
         script_dir / "tesseract.exe",
     ]:
-        if candidate.is_file():
-            return candidate
+        if path.is_file():
+            return path
     return None
 
 
 def validate_tesseract(exe, lang):
     if not exe:
-        raise SystemExit("Tesseract не найден. Положите tesseract.exe в .\\tesseract\\ или передайте --tesseract-cmd.")
+        raise SystemExit("Tesseract не найден. Нужен .\\tesseract\\tesseract.exe или --tesseract-cmd.")
     pytesseract.pytesseract.tesseract_cmd = str(exe)
     tessdata = exe.parent / "tessdata"
     if tessdata.is_dir():
@@ -166,19 +139,10 @@ def validate_tesseract(exe, lang):
         raise SystemExit(f"Не удалось запустить Tesseract: {exc}")
     missing = [x for x in lang.split("+") if x not in available]
     if missing:
-        raise SystemExit(f"В Tesseract нет языков: {', '.join(missing)}")
+        raise SystemExit(f"В Tesseract отсутствуют языки: {', '.join(missing)}")
 
 
-def load_json(path, default=None):
-    if not path.is_file():
-        return {} if default is None else default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {} if default is None else default
-
-
-def load_ocr_index(path):
+def load_index(path):
     rows = {}
     if not path.is_file():
         return rows
@@ -194,123 +158,119 @@ def load_ocr_index(path):
     return rows
 
 
-def write_ocr_index(path, rows):
+def save_index(path, rows):
     with path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=OCR_COLUMNS)
         writer.writeheader()
-        for page in sorted(rows):
-            writer.writerow({key: rows[page].get(key, "") for key in OCR_COLUMNS})
+        for page_no in sorted(rows):
+            writer.writerow({field: rows[page_no].get(field, "") for field in OCR_COLUMNS})
 
 
-def page_metrics(page):
-    text = norm_text(page.get_text("text", sort=True))
-    blocks = page.get_text("blocks", sort=True)
-    image_blocks = [b for b in blocks if len(b) >= 7 and b[6] == 1]
-    area = max(1, page.rect.width * page.rect.height)
-    image_area = sum(max(0, b[2] - b[0]) * max(0, b[3] - b[1]) for b in image_blocks)
-    try:
-        drawings = len(page.get_drawings())
-    except Exception:
-        drawings = 0
-    score, signals = 0, []
-    if len(text) < 35:
-        score += 25
-        signals.append("мало текста")
-    if image_area / area >= 0.55:
-        score += 30
-        signals.append("крупное изображение")
-    if drawings >= 80:
-        score += 30
-        signals.append("много векторной графики")
-    elif drawings >= 25:
-        score += 10
-        signals.append("векторная графика")
-    if PLAN_WORDS_RE.search(text):
-        score += 20
-        signals.append("слова плана")
-    if KEYWORDS_RE.search(text):
-        score -= 35
-        signals.append("слова таблицы площадей")
-    return {
-        "native_text": text,
-        "native_chars": len(text),
-        "native_bad": native_is_bad(text),
-        "plan_score": max(0, score),
-        "plan_signals": "; ".join(signals),
-        "width": page.rect.width,
-        "height": page.rect.height,
-    }
+def predicted_megapixels(page, dpi):
+    width_px = page.rect.width * dpi / 72
+    height_px = page.rect.height * dpi / 72
+    return (width_px * height_px) / 1_000_000
 
 
 def render_page(page, dpi):
     scale = dpi / 72
-    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False)
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(scale, scale),
+        colorspace=fitz.csGRAY,
+        alpha=False,
+    )
     try:
-        image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        return Image.frombytes("L", [pix.width, pix.height], pix.samples)
     finally:
         pix = None
+
+
+def prepare_for_ocr(image):
+    """Минимальная безопасная обработка для мелких цифр и слабого контраста."""
+    image = ImageOps.autocontrast(image, cutoff=0.5)
+    image = ImageEnhance.Contrast(image).enhance(1.35)
     return image
 
 
-def ocr_one_page(page, dpi, lang, psm, timeout):
-    image = render_page(page, dpi)
+def count_tsv_words(tsv):
+    result = 0
+    for line in tsv.splitlines()[1:]:
+        fields = line.split("\t")
+        if len(fields) >= 12 and fields[11].strip():
+            result += 1
+    return result
+
+
+def ocr_page(page, dpi, lang, psm, timeout):
+    raw = render_page(page, dpi)
+    image = prepare_for_ocr(raw)
+    if image is not raw:
+        raw.close()
     megapixels = (image.width * image.height) / 1_000_000
+    config = f"--oem 1 --psm {psm} -c preserve_interword_spaces=1"
     try:
         text = pytesseract.image_to_string(
+            image, lang=lang, config=config, timeout=timeout
+        )
+        tsv = pytesseract.image_to_data(
             image,
             lang=lang,
-            config=f"--oem 1 --psm {psm}",
+            config=config,
             timeout=timeout,
+            output_type=pytesseract.Output.STRING,
         )
-        return norm_text(text), megapixels
+        return norm_text(text), tsv, megapixels
     finally:
         image.close()
 
 
-def write_page_result(ocr_dir, row, text):
-    page = int(row["page"])
-    text_path = ocr_dir / f"page_{page:04d}.txt"
-    meta_path = ocr_dir / f"page_{page:04d}.json"
+def write_page_files(ocr_dir, row, text=None, tsv=None):
+    page_no = int(row["page"])
     if text is not None:
+        text_path = ocr_dir / f"page_{page_no:04d}.txt"
         text_path.write_text(text, encoding="utf-8")
-        row["text_file"] = str(text_path.name)
+        row["text_file"] = text_path.name
+    if tsv is not None:
+        tsv_path = ocr_dir / f"page_{page_no:04d}.tsv"
+        tsv_path.write_text(tsv, encoding="utf-8")
+        row["tsv_file"] = tsv_path.name
+    meta_path = ocr_dir / f"page_{page_no:04d}.json"
     meta_path.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8")
-    row["meta_file"] = str(meta_path.name)
+    row["meta_file"] = meta_path.name
 
 
-def should_process_page(existing, args):
-    if not existing:
+def should_process(existing, retry_failed, overwrite, force):
+    if force or overwrite or not existing:
         return True
     status = existing.get("status", "")
-    if args.force_pages:
-        return True
-    if args.retry_failed and status in RETRYABLE_STATUSES:
+    if retry_failed and status in RETRYABLE_STATUSES:
         return True
     return status not in DONE_STATUSES and status not in RETRYABLE_STATUSES
 
 
-def process_pdf_worker(task):
-    pdf_text = task["pdf_path"]
-    pdf_path = Path(pdf_text)
-    dump_folder = Path(task["dump_folder"])
-    args = task["args"]
-    tesseract_cmd = task["tesseract_cmd"]
+def worker(task):
+    pdf_path = Path(task["pdf"])
+    out_folder = Path(task["folder"])
+    cfg = task["cfg"]
+    force_pages = set(cfg["force_pages"])
 
     os.environ["OMP_THREAD_LIMIT"] = "1"
     os.environ["OMP_NUM_THREADS"] = "1"
-    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    pytesseract.pytesseract.tesseract_cmd = cfg["tesseract"]
 
-    ocr_dir = dump_folder / "ocr"
+    ocr_dir = out_folder / "ocr_quality"
     ocr_dir.mkdir(parents=True, exist_ok=True)
-    index_path = dump_folder / "ocr_index.csv"
-    rows = load_ocr_index(index_path)
+    index_path = out_folder / "ocr_quality_index.csv"
+    index = load_index(index_path)
+    outcome = {
+        "pdf": str(pdf_path), "folder": str(out_folder), "status": "ok",
+        "processed": 0, "ok": 0, "low": 0, "large": 0, "errors": 0,
+    }
     started = time.time()
-    outcome = {"pdf": pdf_text, "status": "ok", "processed": 0, "ok": 0, "skipped": 0, "errors": 0, "folder": str(dump_folder)}
 
     if not pdf_path.is_file():
-        outcome.update({"status": "missing", "errors": 1})
+        outcome.update({"status": "missing", "errors": 1, "reason": "PDF не найден"})
         return outcome
-
     try:
         doc = fitz.open(pdf_path)
     except Exception as exc:
@@ -318,153 +278,145 @@ def process_pdf_worker(task):
         return outcome
 
     try:
-        selected = set(args["force_pages"])
-        for index in range(doc.page_count):
-            page_no = index + 1
-            existing = rows.get(page_no)
-            if not should_process_page(existing, SimpleArgs(args)):
-                continue
-            if selected and page_no not in selected:
+        for page_idx in range(doc.page_count):
+            page_no = page_idx + 1
+            forced = page_no in force_pages
+            if not should_process(index.get(page_no), cfg["retry_failed"], cfg["overwrite"], forced):
                 continue
 
-            page = doc.load_page(index)
-            metrics = page_metrics(page)
+            page = doc.load_page(page_idx)
+            expected_mp = predicted_megapixels(page, cfg["dpi"])
             row = {
                 "page": page_no,
                 "status": "",
-                "dpi": args["dpi"],
-                "megapixels": "",
+                "dpi": cfg["dpi"],
+                "megapixels": round(expected_mp, 2),
                 "chars": "",
+                "tsv_words": "",
                 "seconds": "",
-                "native_chars": metrics["native_chars"],
-                "plan_score": metrics["plan_score"],
                 "reason": "",
                 "text_file": "",
+                "tsv_file": "",
                 "meta_file": "",
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
             outcome["processed"] += 1
 
-            if not args["force_pages"] and not metrics["native_bad"]:
-                row.update({"status": "skipped_native_text", "reason": "нормальный нативный текст"})
-                write_page_result(ocr_dir, row, None)
-                rows[page_no] = row
-                outcome["skipped"] += 1
-                continue
-
-            if not args["force_pages"] and metrics["plan_score"] >= args["plan_skip_score"] and not KEYWORDS_RE.search(metrics["native_text"]):
-                row.update({"status": "skipped_plan_suspect", "reason": f"plan score {metrics['plan_score']}: {metrics['plan_signals']}"})
-                write_page_result(ocr_dir, row, None)
-                rows[page_no] = row
-                outcome["skipped"] += 1
-                continue
-
-            predicted_mp = ((metrics["width"] * args["dpi"] / 72) * (metrics["height"] * args["dpi"] / 72)) / 1_000_000
-            if predicted_mp > args["max_megapixels"]:
-                row.update({"status": "skipped_too_large", "megapixels": round(predicted_mp, 2), "reason": f"{predicted_mp:.2f} MP > limit {args['max_megapixels']} MP"})
-                write_page_result(ocr_dir, row, None)
-                rows[page_no] = row
-                outcome["skipped"] += 1
+            # Единственный автоматический skip: физически большой лист.
+            if expected_mp > cfg["max_megapixels"] and not forced:
+                row.update({
+                    "status": "skipped_too_large",
+                    "reason": f"{expected_mp:.2f} MP > limit {cfg['max_megapixels']:.2f} MP",
+                })
+                write_page_files(ocr_dir, row)
+                index[page_no] = row
+                save_index(index_path, index)
+                outcome["large"] += 1
                 continue
 
             t0 = time.time()
             try:
-                text, megapixels = ocr_one_page(page, args["dpi"], args["ocr_lang"], args["ocr_psm"], args["timeout"])
-                elapsed = time.time() - t0
-                row.update({"megapixels": round(megapixels, 2), "seconds": round(elapsed, 2), "chars": len(text)})
-                if len(text) < args["min_chars"] and not KEYWORDS_RE.search(text):
-                    row.update({"status": "skipped_low_text", "reason": f"OCR text: {len(text)} chars"})
-                    write_page_result(ocr_dir, row, text)
-                    outcome["skipped"] += 1
+                text, tsv, actual_mp = ocr_page(
+                    page, cfg["dpi"], cfg["lang"], cfg["psm"], cfg["timeout"]
+                )
+                row.update({
+                    "megapixels": round(actual_mp, 2),
+                    "chars": len(text),
+                    "tsv_words": count_tsv_words(tsv),
+                    "seconds": round(time.time() - t0, 2),
+                })
+                if len(text) < cfg["min_chars"]:
+                    row.update({
+                        "status": "low_text",
+                        "reason": f"распознано только {len(text)} символов",
+                    })
+                    outcome["low"] += 1
                 else:
                     row["status"] = "ok"
-                    write_page_result(ocr_dir, row, text)
                     outcome["ok"] += 1
+                write_page_files(ocr_dir, row, text, tsv)
             except RuntimeError as exc:
-                elapsed = time.time() - t0
-                reason = str(exc)
-                status = "timeout" if "timeout" in reason.casefold() else "error"
-                row.update({"status": status, "seconds": round(elapsed, 2), "reason": f"{type(exc).__name__}: {reason}"})
-                write_page_result(ocr_dir, row, None)
+                message = str(exc)
+                row.update({
+                    "status": "timeout" if "timeout" in message.casefold() else "error",
+                    "seconds": round(time.time() - t0, 2),
+                    "reason": f"{type(exc).__name__}: {message}",
+                })
+                write_page_files(ocr_dir, row)
                 outcome["errors"] += 1
             except Exception as exc:
-                elapsed = time.time() - t0
-                row.update({"status": "error", "seconds": round(elapsed, 2), "reason": f"{type(exc).__name__}: {exc}"})
-                write_page_result(ocr_dir, row, None)
+                row.update({
+                    "status": "error",
+                    "seconds": round(time.time() - t0, 2),
+                    "reason": f"{type(exc).__name__}: {exc}",
+                })
+                write_page_files(ocr_dir, row)
                 outcome["errors"] += 1
-            rows[page_no] = row
-            write_ocr_index(index_path, rows)
 
-        write_ocr_index(index_path, rows)
-        ocr_manifest = {
-            "source_pdf": pdf_text,
+            index[page_no] = row
+            save_index(index_path, index)
+
+        save_index(index_path, index)
+        manifest = {
+            "source_pdf": str(pdf_path),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "seconds": round(time.time() - started, 2),
             "page_count": doc.page_count,
             "processed_this_run": outcome["processed"],
             "ok_this_run": outcome["ok"],
-            "skipped_this_run": outcome["skipped"],
+            "low_text_this_run": outcome["low"],
+            "skipped_too_large_this_run": outcome["large"],
             "errors_this_run": outcome["errors"],
-            "settings": args,
+            "settings": {k: v for k, v in cfg.items() if k != "tesseract"},
         }
-        (dump_folder / "ocr_manifest.json").write_text(json.dumps(ocr_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        (out_folder / "ocr_quality_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         return outcome
     except Exception as exc:
-        outcome.update({"status": "error", "errors": outcome["errors"] + 1, "reason": f"worker: {type(exc).__name__}: {exc}"})
+        outcome.update({
+            "status": "error",
+            "errors": outcome["errors"] + 1,
+            "reason": f"worker: {type(exc).__name__}: {exc}",
+        })
         return outcome
     finally:
         doc.close()
 
 
-class SimpleArgs:
-    def __init__(self, values):
-        self.__dict__.update(values)
-
-
-def eligible_pdf(pdf_path, dump_root, include_mixed):
-    folder = dump_folder_for(pdf_path, dump_root)
-    manifest = load_json(folder / "manifest.json")
-    if not manifest or manifest.get("status") != "ok":
-        return False, folder, "no_native_dump"
-    mode = manifest.get("document_mode", "")
-    if mode == "scan":
-        return True, folder, mode
-    if include_mixed and mode == "mixed":
-        return True, folder, mode
-    return False, folder, mode or "unknown"
-
-
 def main():
-    ap = argparse.ArgumentParser(description="Быстрый выборочный OCR сканированных БТИ-PDF с постраничным кешем.")
+    ap = argparse.ArgumentParser(
+        description="Качественный OCR БТИ-PDF: 350 DPI + мягкая обработка + пропуск больших листов."
+    )
     ap.add_argument("--csv", required=True, help="CSV с колонкой «путь»")
     ap.add_argument("--path-column", default="путь")
     ap.add_argument("--sep", default=",")
-    ap.add_argument("--dump-root", required=True, help="Папка результата bti_dump_pdfs.py")
-    ap.add_argument("--workers", type=int, default=3, help="Одновременные PDF-процессы; начните с 3")
-    ap.add_argument("--dpi", type=int, default=220)
+    ap.add_argument("--dump-root", required=True, help="Папка с результатами первого native-дампа")
+    ap.add_argument("--workers", type=int, default=2, help="Одновременные PDF; для 350 DPI начать с 2")
+    ap.add_argument("--dpi", type=int, default=350, help="350 по умолчанию: мелкие цифры площадей")
+    ap.add_argument("--max-megapixels", type=float, default=20.0, help="Пропустить лист, если рендер больше этого лимита")
     ap.add_argument("--ocr-lang", default="rus+eng")
     ap.add_argument("--ocr-psm", type=int, default=6)
-    ap.add_argument("--timeout", type=int, default=60, help="Максимум секунд на одну страницу")
-    ap.add_argument("--max-megapixels", type=float, default=14.0, help="Пропустить слишком большие страницы")
-    ap.add_argument("--min-chars", type=int, default=30)
-    ap.add_argument("--plan-skip-score", type=int, default=55)
-    ap.add_argument("--include-mixed", action="store_true", help="Также OCR-ить PDF с режимом mixed")
-    ap.add_argument("--retry-failed", action="store_true", help="Повторить только timeout/error в существующем OCR-кеше")
-    ap.add_argument("--force-pages", default="", help="Номера страниц через запятую: 17,18,42; игнорирует плановый фильтр")
+    ap.add_argument("--timeout", type=int, default=120, help="Максимум секунд на лист")
+    ap.add_argument("--min-chars", type=int, default=15)
+    ap.add_argument("--retry-failed", action="store_true")
+    ap.add_argument("--overwrite", action="store_true", help="Перераспознать всё, игнорируя кеш")
+    ap.add_argument("--force-pages", default="", help="Страницы через запятую, например 17,18; обрабатываются даже сверх лимита")
     ap.add_argument("--tesseract-cmd", default=None)
-    ap.add_argument("--dry-run", action="store_true", help="Показать PDF-кандидаты, не запускать OCR")
     args = ap.parse_args()
 
     if len(args.sep) != 1:
         raise SystemExit("--sep должен быть одним символом")
     if args.workers < 1:
         raise SystemExit("--workers должен быть не меньше 1")
-    if args.dpi < 100:
-        raise SystemExit("--dpi слишком низкий")
+    if args.dpi < 300:
+        raise SystemExit("Для качественного режима --dpi должен быть не менее 300")
+    if args.max_megapixels <= 0:
+        raise SystemExit("--max-megapixels должен быть больше 0")
     try:
         force_pages = sorted({int(x.strip()) for x in args.force_pages.split(",") if x.strip()})
     except ValueError:
-        raise SystemExit("--force-pages: только номера через запятую, например 17,18,42")
+        raise SystemExit("--force-pages: номера страниц через запятую, например 17,18")
 
     csv_path = Path(args.csv)
     dump_root = Path(args.dump_root)
@@ -476,63 +428,61 @@ def main():
     if not paths:
         raise SystemExit("В CSV нет непустых путей")
 
-    script_dir = Path(__file__).resolve().parent
-    tesseract = find_tesseract(script_dir, args.tesseract_cmd)
+    tesseract = find_tesseract(Path(__file__).resolve().parent, args.tesseract_cmd)
     validate_tesseract(tesseract, args.ocr_lang)
 
-    tasks, skipped = [], []
-    public_args = {
+    cfg = {
         "dpi": args.dpi,
-        "ocr_lang": args.ocr_lang,
-        "ocr_psm": args.ocr_psm,
-        "timeout": args.timeout,
         "max_megapixels": args.max_megapixels,
+        "lang": args.ocr_lang,
+        "psm": args.ocr_psm,
+        "timeout": args.timeout,
         "min_chars": args.min_chars,
-        "plan_skip_score": args.plan_skip_score,
         "retry_failed": args.retry_failed,
+        "overwrite": args.overwrite,
         "force_pages": force_pages,
+        "tesseract": str(tesseract),
     }
-    for path in paths:
-        ok, folder, reason = eligible_pdf(path, dump_root, args.include_mixed)
-        if ok:
-            tasks.append({"pdf_path": str(path), "dump_folder": str(folder), "args": public_args, "tesseract_cmd": str(tesseract)})
-        else:
-            skipped.append((str(path), reason, str(folder)))
+    tasks = [
+        {"pdf": str(path), "folder": str(dump_folder_for(path, dump_root)), "cfg": cfg}
+        for path in paths
+    ]
 
-    print(f"Всего путей: {len(paths)} | OCR-кандидатов: {len(tasks)} | пропущено: {len(skipped)}")
-    if skipped:
-        by_reason = {}
-        for _, reason, _ in skipped:
-            by_reason[reason] = by_reason.get(reason, 0) + 1
-        print("Пропуски PDF:", ", ".join(f"{k}={v}" for k, v in sorted(by_reason.items())))
-    if args.dry_run:
-        for task in tasks[:30]:
-            print(task["pdf_path"])
-        if len(tasks) > 30:
-            print(f"... ещё {len(tasks)-30}")
-        return
-
-    summary_path = dump_root / "ocr_run_summary.csv"
-    summary_fields = ["source_pdf", "status", "output_folder", "processed_pages", "ok_pages", "skipped_pages", "error_pages", "reason"]
+    summary_path = dump_root / "ocr_quality_run_summary.csv"
+    fields = [
+        "source_pdf", "status", "output_folder", "processed_pages", "ok_pages",
+        "low_text_pages", "skipped_too_large_pages", "error_pages", "reason",
+    ]
     counts = {"ok": 0, "error": 0, "missing": 0}
     with summary_path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=summary_fields)
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
-            futures = [pool.submit(process_pdf_worker, task) for task in tasks]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="OCR PDF", unit="pdf"):
+            futures = [pool.submit(worker, task) for task in tasks]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Quality OCR", unit="pdf"):
                 try:
                     result = future.result()
                 except Exception as exc:
-                    result = {"pdf": "", "status": "error", "folder": "", "processed": 0, "ok": 0, "skipped": 0, "errors": 1, "reason": f"executor: {type(exc).__name__}: {exc}"}
+                    result = {
+                        "pdf": "", "folder": "", "status": "error", "processed": 0,
+                        "ok": 0, "low": 0, "large": 0, "errors": 1,
+                        "reason": f"executor: {type(exc).__name__}: {exc}",
+                    }
                 counts[result["status"]] = counts.get(result["status"], 0) + 1
                 writer.writerow({
-                    "source_pdf": result.get("pdf", ""), "status": result.get("status", ""), "output_folder": result.get("folder", ""),
-                    "processed_pages": result.get("processed", 0), "ok_pages": result.get("ok", 0),
-                    "skipped_pages": result.get("skipped", 0), "error_pages": result.get("errors", 0), "reason": result.get("reason", ""),
+                    "source_pdf": result.get("pdf", ""),
+                    "status": result.get("status", ""),
+                    "output_folder": result.get("folder", ""),
+                    "processed_pages": result.get("processed", 0),
+                    "ok_pages": result.get("ok", 0),
+                    "low_text_pages": result.get("low", 0),
+                    "skipped_too_large_pages": result.get("large", 0),
+                    "error_pages": result.get("errors", 0),
+                    "reason": result.get("reason", ""),
                 })
                 f.flush()
-    print("Готово:", ", ".join(f"{k}={v}" for k, v in counts.items()))
+
+    print("Готово:", ", ".join(f"{key}={value}" for key, value in counts.items()))
     print(f"Сводка: {summary_path}")
 
 
