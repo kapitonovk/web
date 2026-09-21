@@ -3,6 +3,10 @@
 """
 BTI PDF dumper: CSV (колонка «путь») -> один дамп на PDF.
 
+По умолчанию OCR ВЫКЛЮЧЕН: сначала соберите быстрый нативный дамп всего списка.
+Затем используйте run_summary.csv и manifest.json, чтобы решить, какие PDF
+действительно отправлять на OCR отдельным запуском (--ocr auto / --ocr force).
+
 На каждый PDF создаёт:
   <outdir>/<safe_pdf_name>__<hash>/dump.xlsx
   <outdir>/<safe_pdf_name>__<hash>/text.txt
@@ -15,8 +19,12 @@ Tesseract ожидается рядом со скриптом в папке tess
   .\tesseract\tesseract.exe
   .\tesseract\tessdata\rus.traineddata
 
-Пример:
+Примеры:
+  # Быстрый первый проход: без OCR
   py bti_dump_pdfs.py --csv bti_candidates.csv --outdir bti_dumps
+
+  # Позднее: обработать только PDF, которым нужен OCR
+  py bti_dump_pdfs.py --csv ocr_candidates.csv --outdir bti_dumps --ocr auto --overwrite
 """
 
 import argparse
@@ -25,8 +33,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
-import sys
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -78,7 +84,7 @@ def safe_name(text):
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r'[<>:"/\\|?*]', "_", text)
     text = re.sub(r"\s+", " ", text).strip(" ._")
-    return (text[:80] or "pdf")
+    return text[:80] or "pdf"
 
 
 def short_hash(path):
@@ -110,9 +116,7 @@ def find_tesseract(script_dir, supplied):
             script_dir / "tesseract.exe",
         ]
         p = next((x for x in candidates if x.is_file()), None)
-    if p is None or not p.is_file():
-        return None
-    return p
+    return p if p and p.is_file() else None
 
 
 def setup_tesseract(exe, lang):
@@ -127,9 +131,7 @@ def setup_tesseract(exe, lang):
     except Exception as exc:
         return False, f"не удалось запустить Tesseract: {exc}"
     missing = [x for x in lang.split("+") if x not in langs]
-    if missing:
-        return False, f"в Tesseract нет языков: {', '.join(missing)}"
-    return True, ""
+    return (not missing), ("" if not missing else f"в Tesseract нет языков: {', '.join(missing)}")
 
 
 def page_meta(page):
@@ -170,9 +172,8 @@ def choose_mode(metas, probe_pages):
 
 
 def plan_score(meta):
+    score, signals = 0, []
     text = meta["native_text"]
-    score = 0
-    signals = []
     if meta["native_chars"] < 35:
         score += 25
         signals.append("мало текста")
@@ -182,7 +183,7 @@ def plan_score(meta):
     if meta["drawings"] >= 80:
         score += 30
         signals.append("много векторной графики")
-    if meta["drawings"] >= 25:
+    elif meta["drawings"] >= 25:
         score += 10
         signals.append("векторная графика")
     if PLAN_WORDS_RE.search(text):
@@ -226,8 +227,7 @@ def clean_cell(value):
 
 def table_score(rows, context):
     flat = " ".join(clean_cell(c) for row in rows for c in row)
-    score = 0
-    signals = []
+    score, signals = 0, []
     for label, pts, pat in [
         ("экспликация", 50, r"эксплик"),
         ("площадь", 25, r"площад"),
@@ -237,8 +237,7 @@ def table_score(rows, context):
         if re.search(pat, flat + " " + context, re.I):
             score += pts
             signals.append(label)
-    numbers = len(NUMBER_RE.findall(flat))
-    if numbers >= 8:
+    if len(NUMBER_RE.findall(flat)) >= 8:
         score += 10
         signals.append("много чисел")
     return score, "; ".join(signals)
@@ -252,8 +251,7 @@ def context_for_page(text):
 def extract_native_tables(pdf_path, page_no):
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            page = pdf.pages[page_no - 1]
-            tables = page.extract_tables()
+            tables = pdf.pages[page_no - 1].extract_tables()
     except Exception:
         return []
     return [[list(map(clean_cell, row)) for row in table] for table in tables if table]
@@ -267,41 +265,28 @@ def add_table(tables, page_no, method, rows, context):
     rows = [row + [""] * (ncols - len(row)) for row in rows]
     score, signals = table_score(rows, context)
     tables.append({
-        "table_id": f"T{len(tables)+1:05d}",
-        "page": page_no,
-        "method": method,
-        "rows": rows,
-        "nrows": len(rows),
-        "ncols": ncols,
+        "table_id": f"T{len(tables)+1:05d}", "page": page_no, "method": method,
+        "rows": rows, "nrows": len(rows), "ncols": ncols,
         "nonempty": sum(bool(clean_cell(c)) for row in rows for c in row),
-        "context": context,
-        "area_score": score,
-        "area_signals": signals,
+        "context": context, "area_score": score, "area_signals": signals,
     })
 
 
-def write_xlsx(path, source_path, mode, pages, tables):
-    wb = Workbook(write_only=False)
+def write_xlsx(path, pages, tables):
+    wb = Workbook()
     ws = wb.active
     ws.title = "index"
-    headers = [
-        "table_id", "page", "method", "rows", "cols", "nonempty_cells",
-        "area_score", "area_signals", "context_before",
-    ]
+    headers = ["table_id", "page", "method", "rows", "cols", "nonempty_cells", "area_score", "area_signals", "context_before"]
     ws.append(headers)
     for t in tables:
         ws.append([t["table_id"], t["page"], t["method"], t["nrows"], t["ncols"], t["nonempty"], t["area_score"], t["area_signals"], t["context"]])
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
 
     long_ws = wb.create_sheet("tables_long")
     long_ws.append(["table_id", "page", "method", "row", "col", "value"])
     for t in tables:
-        for r_idx, row in enumerate(t["rows"], start=1):
-            for c_idx, value in enumerate(row, start=1):
+        for r_idx, row in enumerate(t["rows"], 1):
+            for c_idx, value in enumerate(row, 1):
                 long_ws.append([t["table_id"], t["page"], t["method"], r_idx, c_idx, clean_cell(value)])
-    long_ws.freeze_panes = "A2"
-    long_ws.auto_filter.ref = long_ws.dimensions
 
     wide_ws = wb.create_sheet("tables_wide")
     for t in tables:
@@ -310,52 +295,33 @@ def write_xlsx(path, source_path, mode, pages, tables):
         for row in t["rows"]:
             wide_ws.append([clean_cell(x) for x in row])
         wide_ws.append([])
-    wide_ws.freeze_panes = "A1"
 
-    page_ws = wb.create_sheet("text_by_page")
-    page_ws.append(["page", "text_method", "text", "ocr_action", "skip_reason"])
+    text_ws = wb.create_sheet("text_by_page")
+    text_ws.append(["page", "text_method", "text", "ocr_action", "skip_reason"])
     for p in pages:
-        page_ws.append([p["page"], p["text_method"], p["final_text"], p["ocr_action"], p["skip_reason"]])
-    page_ws.freeze_panes = "A2"
-    page_ws.auto_filter.ref = page_ws.dimensions
+        text_ws.append([p["page"], p["text_method"], p["final_text"], p["ocr_action"], p["skip_reason"]])
 
     meta_ws = wb.create_sheet("page_index")
-    meta_ws.append([
-        "page", "native_chars", "native_bad", "text_blocks", "image_blocks", "image_share",
-        "image_refs", "drawings", "width_pt", "height_pt", "plan_suspect_score",
-        "plan_signals", "ocr_action", "ocr_text_chars", "skip_reason",
-    ])
+    meta_ws.append(["page", "native_chars", "native_bad", "text_blocks", "image_blocks", "image_share", "image_refs", "drawings", "width_pt", "height_pt", "plan_suspect_score", "plan_signals", "ocr_action", "ocr_text_chars", "skip_reason"])
     for p in pages:
-        meta_ws.append([
-            p["page"], p["native_chars"], p["native_bad"], p["text_blocks"], p["image_blocks"],
-            p["image_share"], p["image_refs"], p["drawings"], p["width"], p["height"],
-            p["plan_score"], p["plan_signals"], p["ocr_action"], len(p["ocr_text"]), p["skip_reason"],
-        ])
-    meta_ws.freeze_panes = "A2"
-    meta_ws.auto_filter.ref = meta_ws.dimensions
+        meta_ws.append([p["page"], p["native_chars"], p["native_bad"], p["text_blocks"], p["image_blocks"], p["image_share"], p["image_refs"], p["drawings"], p["width"], p["height"], p["plan_score"], p["plan_signals"], p["ocr_action"], len(p["ocr_text"]), p["skip_reason"]])
 
     for sheet in wb.worksheets:
-        sheet.sheet_view.showGridLines = True
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
         for cell in sheet[1]:
             cell.font = Font(bold=True)
             cell.alignment = Alignment(wrap_text=True, vertical="top")
-        sheet.freeze_panes = sheet.freeze_panes or "A2"
-    for sheet in [ws, long_ws, page_ws, meta_ws]:
-        for col in sheet.columns:
-            letter = col[0].column_letter
-            sample = max((len(str(x.value or "")) for x in col[:100]), default=10)
-            sheet.column_dimensions[letter].width = min(max(sample + 2, 12), 55)
-    page_ws.column_dimensions["C"].width = 100
+    text_ws.column_dimensions["C"].width = 100
+    text_ws.column_dimensions["E"].width = 55
     ws.column_dimensions["I"].width = 100
-
     wb.save(path)
 
 
 def write_text(path, pages):
     with path.open("w", encoding="utf-8") as f:
         for p in pages:
-            method = p["text_method"]
-            f.write(f"===== PAGE {p['page']:04d} | {method} =====\n")
+            f.write(f"===== PAGE {p['page']:04d} | {p['text_method']} =====\n")
             if p["final_text"]:
                 f.write(p["final_text"] + "\n")
             elif p["skip_reason"]:
@@ -367,77 +333,45 @@ def process_pdf(pdf_path, outdir, args, ocr_ready):
     folder = outdir / f"{safe_name(pdf_path.stem)}__{short_hash(pdf_path)}"
     manifest_path = folder / "manifest.json"
     if manifest_path.is_file() and not args.overwrite:
-        return "skipped_existing", str(folder)
+        return "skipped_existing", str(folder), {}
     folder.mkdir(parents=True, exist_ok=True)
-
-    manifest = {
-        "source_pdf": str(pdf_path),
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "status": "error",
-        "ocr_ready": ocr_ready,
-    }
+    manifest = {"source_pdf": str(pdf_path), "created_at": datetime.now().isoformat(timespec="seconds"), "status": "error", "ocr_mode": args.ocr, "ocr_ready": ocr_ready}
     if not pdf_path.is_file():
         manifest["error"] = "source PDF not found"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        return "missing", str(folder)
-
+        return "missing", str(folder), manifest
     try:
         doc = fitz.open(pdf_path)
     except Exception as exc:
         manifest["error"] = f"cannot open PDF: {type(exc).__name__}: {exc}"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        return "error", str(folder)
-
+        return "error", str(folder), manifest
     try:
         metas = [page_meta(doc.load_page(i)) for i in range(doc.page_count)]
         mode = choose_mode(metas, args.probe_pages)
-        pages = []
-        tables = []
-
+        pages, tables = [], []
         for index, meta in enumerate(metas):
             page_no = index + 1
             page = doc.load_page(index)
             pscore, psignals = plan_score(meta)
-            meta.update({
-                "page": page_no,
-                "plan_score": pscore,
-                "plan_signals": psignals,
-                "ocr_action": "not_needed",
-                "skip_reason": "",
-                "ocr_text": "",
-                "final_text": meta["native_text"],
-                "text_method": "native" if meta["native_text"] else "none",
-            })
-
-            needs_ocr = mode == "scan" or (mode == "mixed" and meta["native_bad"])
+            meta.update({"page": page_no, "plan_score": pscore, "plan_signals": psignals, "ocr_action": "not_requested", "skip_reason": "", "ocr_text": "", "final_text": meta["native_text"], "text_method": "native" if meta["native_text"] else "none"})
+            needs_ocr = args.ocr == "force" or (args.ocr == "auto" and (mode == "scan" or (mode == "mixed" and meta["native_bad"])))
             has_keywords = bool(KEYWORDS_RE.search(meta["native_text"]))
             if needs_ocr:
                 if pscore >= args.plan_skip_score and not has_keywords:
-                    meta["ocr_action"] = "skipped_plan_suspect"
-                    meta["skip_reason"] = f"plan score {pscore}: {psignals}"
-                    meta["final_text"] = ""
-                    meta["text_method"] = "skipped"
+                    meta.update({"ocr_action": "skipped_plan_suspect", "skip_reason": f"plan score {pscore}: {psignals}", "final_text": "", "text_method": "skipped"})
                 elif not ocr_ready:
-                    meta["ocr_action"] = "skipped_no_tesseract"
-                    meta["skip_reason"] = "Tesseract unavailable"
+                    meta.update({"ocr_action": "skipped_no_tesseract", "skip_reason": "Tesseract unavailable"})
                 else:
                     try:
                         preview = ocr_page(page, args.preview_dpi, args.ocr_lang, args.ocr_psm)
                         if len(preview) < args.preview_min_chars and not KEYWORDS_RE.search(preview):
-                            meta["ocr_action"] = "skipped_low_text_preview"
-                            meta["skip_reason"] = f"OCR preview: {len(preview)} chars"
-                            meta["final_text"] = preview
-                            meta["text_method"] = "ocr_preview"
+                            meta.update({"ocr_action": "skipped_low_text_preview", "skip_reason": f"OCR preview: {len(preview)} chars", "final_text": preview, "text_method": "ocr_preview"})
                         else:
                             full = ocr_page(page, args.ocr_dpi, args.ocr_lang, args.ocr_psm)
-                            meta["ocr_action"] = "full_ocr"
-                            meta["ocr_text"] = full
-                            meta["final_text"] = full
-                            meta["text_method"] = "ocr"
+                            meta.update({"ocr_action": "full_ocr", "ocr_text": full, "final_text": full, "text_method": "ocr"})
                     except Exception as exc:
-                        meta["ocr_action"] = "ocr_error"
-                        meta["skip_reason"] = f"{type(exc).__name__}: {exc}"
-
+                        meta.update({"ocr_action": "ocr_error", "skip_reason": f"{type(exc).__name__}: {exc}"})
             context = context_for_page(meta["final_text"])
             native_tables = extract_native_tables(pdf_path, page_no) if not meta["native_bad"] else []
             if native_tables:
@@ -446,29 +380,25 @@ def process_pdf(pdf_path, outdir, args, ocr_ready):
             else:
                 loose = loose_table(meta["final_text"])
                 if loose:
-                    method = "ocr_loose" if meta["text_method"].startswith("ocr") else "native_loose"
-                    add_table(tables, page_no, method, loose, context)
+                    add_table(tables, page_no, "ocr_loose" if meta["text_method"].startswith("ocr") else "native_loose", loose, context)
             pages.append(meta)
-
-        write_xlsx(folder / "dump.xlsx", pdf_path, mode, pages, tables)
+        write_xlsx(folder / "dump.xlsx", pages, tables)
         write_text(folder / "text.txt", pages)
         manifest.update({
-            "status": "ok",
-            "document_mode": mode,
-            "page_count": len(pages),
-            "tables_count": len(tables),
+            "status": "ok", "document_mode": mode, "page_count": len(pages), "tables_count": len(tables),
             "native_pages": sum(p["text_method"] == "native" for p in pages),
             "ocr_pages": sum(p["text_method"] == "ocr" for p in pages),
+            "ocr_preview_pages": sum(p["text_method"] == "ocr_preview" for p in pages),
+            "native_bad_pages": sum(p["native_bad"] for p in pages),
             "skipped_plan_pages": sum(p["ocr_action"] == "skipped_plan_suspect" for p in pages),
-            "output_xlsx": str(folder / "dump.xlsx"),
-            "output_text": str(folder / "text.txt"),
+            "output_xlsx": str(folder / "dump.xlsx"), "output_text": str(folder / "text.txt"),
         })
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        return "ok", str(folder)
+        return "ok", str(folder), manifest
     except Exception as exc:
         manifest["error"] = f"{type(exc).__name__}: {exc}"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        return "error", str(folder)
+        return "error", str(folder), manifest
     finally:
         doc.close()
 
@@ -476,10 +406,11 @@ def process_pdf(pdf_path, outdir, args, ocr_ready):
 def main():
     ap = argparse.ArgumentParser(description="Полный дамп текста и таблиц БТИ-PDF из CSV путей.")
     ap.add_argument("--csv", required=True, help="CSV с колонкой «путь»")
-    ap.add_argument("--path-column", default="путь", help="Название колонки с PDF-путём")
+    ap.add_argument("--path-column", default="путь")
     ap.add_argument("--sep", default=",", help="Разделитель CSV: ',' или ';'")
-    ap.add_argument("--outdir", default="bti_dumps", help="Папка результатов")
-    ap.add_argument("--tesseract-cmd", default=None, help="Путь к tesseract.exe, если он не рядом")
+    ap.add_argument("--outdir", default="bti_dumps")
+    ap.add_argument("--ocr", choices=["off", "auto", "force"], default="off", help="off (по умолчанию), auto или force")
+    ap.add_argument("--tesseract-cmd", default=None)
     ap.add_argument("--ocr-lang", default="rus+eng")
     ap.add_argument("--ocr-dpi", type=int, default=300)
     ap.add_argument("--preview-dpi", type=int, default=120)
@@ -487,42 +418,33 @@ def main():
     ap.add_argument("--probe-pages", type=int, default=4)
     ap.add_argument("--preview-min-chars", type=int, default=40)
     ap.add_argument("--plan-skip-score", type=int, default=55)
-    ap.add_argument("--overwrite", action="store_true", help="Перезаписать уже обработанные PDF")
+    ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
-
     if len(args.sep) != 1:
         raise SystemExit("--sep должен быть одним символом")
-    if args.ocr_dpi < 150 or args.preview_dpi < 72:
-        raise SystemExit("Слишком низкий DPI")
-
     csv_path = Path(args.csv)
     if not csv_path.is_file():
         raise SystemExit(f"Нет CSV: {csv_path}")
     paths = read_paths(csv_path, args.path_column, args.sep)
     if not paths:
         raise SystemExit("В CSV нет непустых путей")
-
     script_dir = Path(__file__).resolve().parent
     tesseract = find_tesseract(script_dir, args.tesseract_cmd)
-    ocr_ready, ocr_note = setup_tesseract(tesseract, args.ocr_lang)
-    if not ocr_ready:
-        print(f"OCR отключён: {ocr_note}")
-    else:
-        print(f"Tesseract: {tesseract}")
-
+    ocr_ready, note = setup_tesseract(tesseract, args.ocr_lang) if args.ocr != "off" else (False, "OCR выключен параметром --ocr off")
+    print(f"OCR: {args.ocr}. {note or ('Tesseract: ' + str(tesseract))}")
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     summary_path = outdir / "run_summary.csv"
+    fields = ["source_pdf", "status", "output_folder", "document_mode", "page_count", "tables_count", "native_pages", "native_bad_pages", "ocr_pages", "ocr_preview_pages", "skipped_plan_pages", "ocr_mode"]
     counts = {"ok": 0, "error": 0, "missing": 0, "skipped_existing": 0}
     with summary_path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["source_pdf", "status", "output_folder"])
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for path in tqdm(paths, desc="BTI PDF", unit="pdf"):
-            status, folder = process_pdf(path, outdir, args, ocr_ready)
+            status, folder, manifest = process_pdf(path, outdir, args, ocr_ready)
             counts[status] = counts.get(status, 0) + 1
-            writer.writerow({"source_pdf": str(path), "status": status, "output_folder": folder})
+            writer.writerow({"source_pdf": str(path), "status": status, "output_folder": folder, **{k: manifest.get(k, "") for k in fields if k not in {"source_pdf", "status", "output_folder"}}})
             f.flush()
-
     print("Готово:", ", ".join(f"{k}={v}" for k, v in counts.items()))
     print(f"Сводка: {summary_path}")
 
