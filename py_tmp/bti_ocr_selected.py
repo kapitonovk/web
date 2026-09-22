@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Качественный OCR БТИ-PDF с пропуском больших листов чертежей.
+Качественный OCR БТИ-PDF: PSM 11 + TSV + восстановленный порядок чтения.
 
 Вход: CSV с колонкой «путь».
-Выход: в --dump-root/<safe_stem>__<hash>/ создаются:
-  ocr_quality/page_0001.txt   — OCR-текст страницы
-  ocr_quality/page_0001.tsv   — OCR TSV: слова + координаты + confidence
-  ocr_quality/page_0001.json  — метаданные и статус страницы
-  ocr_quality_index.csv       — постраничный кеш / индекс
-  ocr_quality_manifest.json   — сводка одного PDF
+
+Для каждого PDF создаёт в --dump-root/<safe_stem>__<hash>/:
+  ocr_quality/
+    page_0001.txt                 сырой plain-text Tesseract (PSM 11)
+    page_0001.tsv                 TSV: все слова + координаты + confidence
+    page_0001_reading_order.txt   TSV, собранный в визуальные строки
+    page_0001.json                метаданные и статус страницы
+  ocr_quality_index.csv           постраничный кеш / индекс
+  ocr_quality_manifest.json       сводка OCR одного PDF
 
 Логика:
-  - OCR-ятся ВСЕ страницы PDF, кроме слишком больших листов.
-  - До рендера вычисляется ожидаемый размер изображения на заданном DPI.
-  - Листы выше --max-megapixels пропускаются как «чертёж / большой лист».
-  - Это единственное автоматическое исключение: нет отбора по ключевым словам,
-    нет фильтра по «плановым» словам, нет preview и нет поворотов.
-  - Для остальных листов: 350 DPI, grayscale, autocontrast и мягкий контраст.
-    Бинаризация намеренно не применяется: она может уничтожить запятые/точки
-    и тонкие цифры площадей.
-  - TXT и TSV сохраняются для каждого распознанного листа.
+  - PSM 11 по умолчанию: максимум найденного текста и мелких цифр.
+  - Рендер 350 DPI, grayscale, autocontrast, умеренный contrast 1.35.
+  - Нет бинаризации, удаления линий, поиска таблиц или контентных фильтров.
+  - Единственный автоматический skip: слишком большой лист по расчётному
+    числу мегапикселей (обычно A3/A2 чертежи).
+  - Не вращает страницы.
+  - reading_order.txt собирается ИЗ TSV: слова группируются в визуальные
+    строки по вертикальной близости, затем сортируются слева направо.
+    Он улучшает читаемость PSM 11, но raw TXT и TSV всегда сохраняются.
 
 Кеширование:
-  - ok, low_text и skipped_too_large повторно не обрабатываются.
+  - ok, low_text, skipped_too_large не обрабатываются повторно.
   - --retry-failed повторяет только timeout/error.
-  - --overwrite принудительно повторяет все страницы.
-  - --force-pages "17,18" позволяет обработать конкретные большие листы,
-    игнорируя ограничение megapixels.
+  - --overwrite ПЕРЕРАСПОЗНАЁТ все страницы, кроме больших листов;
+    --force-pages обрабатывает указанные страницы даже сверх лимита.
 
 Зависимости:
   py -m pip install pymupdf pytesseract pillow tqdm
@@ -37,8 +39,15 @@ Tesseract рядом со скриптом:
   .\tesseract\tessdata\rus.traineddata
   .\tesseract\tessdata\eng.traineddata
 
-Пример:
+Примеры:
+  # Основной запуск
   py bti_ocr_selected.py --csv ocr_candidates.csv --sep ";" --dump-root bti_dumps --workers 2
+
+  # Перераспознать страницы после смены настроек
+  py bti_ocr_selected.py --csv ocr_candidates.csv --sep ";" --dump-root bti_dumps --workers 2 --overwrite
+
+  # OCR конкретного большого листа
+  py bti_ocr_selected.py --csv one_pdf.csv --sep ";" --dump-root bti_dumps --workers 1 --force-pages "37"
 """
 
 import argparse
@@ -47,13 +56,13 @@ import hashlib
 import json
 import os
 import re
+import statistics
 import time
 import unicodedata
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-# Один OCR-процесс на один поток; параллелизм задаётся --workers.
 os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
@@ -69,8 +78,9 @@ except ImportError:
 
 
 OCR_COLUMNS = [
-    "page", "status", "dpi", "megapixels", "chars", "tsv_words", "seconds",
-    "reason", "text_file", "tsv_file", "meta_file", "updated_at",
+    "page", "status", "dpi", "psm", "megapixels", "chars", "tsv_words",
+    "reading_order_lines", "seconds", "reason", "text_file", "tsv_file",
+    "reading_order_file", "meta_file", "updated_at",
 ]
 DONE_STATUSES = {"ok", "low_text", "skipped_too_large"}
 RETRYABLE_STATUSES = {"error", "timeout"}
@@ -167,9 +177,7 @@ def save_index(path, rows):
 
 
 def predicted_megapixels(page, dpi):
-    width_px = page.rect.width * dpi / 72
-    height_px = page.rect.height * dpi / 72
-    return (width_px * height_px) / 1_000_000
+    return ((page.rect.width * dpi / 72) * (page.rect.height * dpi / 72)) / 1_000_000
 
 
 def render_page(page, dpi):
@@ -186,19 +194,81 @@ def render_page(page, dpi):
 
 
 def prepare_for_ocr(image):
-    """Минимальная безопасная обработка для мелких цифр и слабого контраста."""
+    """Мягкая обработка: усиливает слабый скан, не уничтожая дробные знаки."""
     image = ImageOps.autocontrast(image, cutoff=0.5)
-    image = ImageEnhance.Contrast(image).enhance(1.35)
-    return image
+    return ImageEnhance.Contrast(image).enhance(1.35)
 
 
-def count_tsv_words(tsv):
-    result = 0
-    for line in tsv.splitlines()[1:]:
-        fields = line.split("\t")
-        if len(fields) >= 12 and fields[11].strip():
-            result += 1
-    return result
+def parse_tsv_words(tsv):
+    """Возвращает все непустые word-level (level=5) записи Tesseract TSV."""
+    reader = csv.DictReader(tsv.splitlines(), delimiter="\t")
+    words = []
+    for row in reader:
+        text = (row.get("text") or "").strip()
+        if not text or row.get("level") != "5":
+            continue
+        try:
+            conf = float(row.get("conf", "-1"))
+            left = int(row.get("left", "0"))
+            top = int(row.get("top", "0"))
+            width = int(row.get("width", "0"))
+            height = int(row.get("height", "0"))
+        except ValueError:
+            continue
+        words.append({
+            "text": text, "conf": conf, "left": left, "top": top,
+            "width": width, "height": height,
+            "cx": left + width / 2, "cy": top + height / 2,
+        })
+    return words
+
+
+def reading_order_from_tsv(tsv):
+    """
+    Собирает PSM 11 TSV в визуальные строки.
+
+    Не фильтрует слова по confidence: для БТИ важны мелкие цифры, а итоговое
+    решение о качестве лучше принимать позднее по raw TSV и контексту.
+    """
+    words = parse_tsv_words(tsv)
+    if not words:
+        return "", 0
+
+    heights = [w["height"] for w in words if w["height"] > 0]
+    median_height = statistics.median(heights) if heights else 20
+    # Допуск по вертикали: и в пикселях, и пропорционально реальной высоте букв.
+    y_tolerance = max(8.0, median_height * 0.65)
+
+    words.sort(key=lambda w: (w["cy"], w["left"]))
+    lines = []
+    for word in words:
+        candidates = []
+        for line in lines:
+            delta = abs(word["cy"] - line["cy"])
+            if delta <= y_tolerance:
+                candidates.append((delta, line))
+        if candidates:
+            _, line = min(candidates, key=lambda item: item[0])
+            line["words"].append(word)
+            line["cy"] = sum(w["cy"] for w in line["words"]) / len(line["words"])
+            line["top"] = min(line["top"], word["top"])
+            line["bottom"] = max(line["bottom"], word["top"] + word["height"])
+        else:
+            lines.append({
+                "cy": word["cy"], "top": word["top"], "bottom": word["top"] + word["height"], "words": [word]
+            })
+
+    lines.sort(key=lambda line: (line["top"], min(w["left"] for w in line["words"])))
+    rendered = []
+    previous_bottom = None
+    paragraph_gap = max(median_height * 1.8, 28)
+    for line in lines:
+        line["words"].sort(key=lambda w: w["left"])
+        if previous_bottom is not None and line["top"] - previous_bottom > paragraph_gap:
+            rendered.append("")
+        rendered.append(" ".join(w["text"] for w in line["words"]))
+        previous_bottom = max(previous_bottom or 0, line["bottom"])
+    return "\n".join(rendered).strip(), len(lines)
 
 
 def ocr_page(page, dpi, lang, psm, timeout):
@@ -209,9 +279,9 @@ def ocr_page(page, dpi, lang, psm, timeout):
     megapixels = (image.width * image.height) / 1_000_000
     config = f"--oem 1 --psm {psm} -c preserve_interword_spaces=1"
     try:
-        text = pytesseract.image_to_string(
-            image, lang=lang, config=config, timeout=timeout
-        )
+        # Два формата вызываются отдельно: raw text удобен для контроля,
+        # TSV — источник истины для порядка, строк и будущих таблиц.
+        text = pytesseract.image_to_string(image, lang=lang, config=config, timeout=timeout)
         tsv = pytesseract.image_to_data(
             image,
             lang=lang,
@@ -224,19 +294,23 @@ def ocr_page(page, dpi, lang, psm, timeout):
         image.close()
 
 
-def write_page_files(ocr_dir, row, text=None, tsv=None):
+def write_page_files(ocr_dir, row, text=None, tsv=None, reading_order=None):
     page_no = int(row["page"])
     if text is not None:
-        text_path = ocr_dir / f"page_{page_no:04d}.txt"
-        text_path.write_text(text, encoding="utf-8")
-        row["text_file"] = text_path.name
+        path = ocr_dir / f"page_{page_no:04d}.txt"
+        path.write_text(text, encoding="utf-8")
+        row["text_file"] = path.name
     if tsv is not None:
-        tsv_path = ocr_dir / f"page_{page_no:04d}.tsv"
-        tsv_path.write_text(tsv, encoding="utf-8")
-        row["tsv_file"] = tsv_path.name
-    meta_path = ocr_dir / f"page_{page_no:04d}.json"
-    meta_path.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8")
-    row["meta_file"] = meta_path.name
+        path = ocr_dir / f"page_{page_no:04d}.tsv"
+        path.write_text(tsv, encoding="utf-8")
+        row["tsv_file"] = path.name
+    if reading_order is not None:
+        path = ocr_dir / f"page_{page_no:04d}_reading_order.txt"
+        path.write_text(reading_order, encoding="utf-8")
+        row["reading_order_file"] = path.name
+    path = ocr_dir / f"page_{page_no:04d}.json"
+    path.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8")
+    row["meta_file"] = path.name
 
 
 def should_process(existing, retry_failed, overwrite, force):
@@ -290,13 +364,16 @@ def worker(task):
                 "page": page_no,
                 "status": "",
                 "dpi": cfg["dpi"],
+                "psm": cfg["psm"],
                 "megapixels": round(expected_mp, 2),
                 "chars": "",
                 "tsv_words": "",
+                "reading_order_lines": "",
                 "seconds": "",
                 "reason": "",
                 "text_file": "",
                 "tsv_file": "",
+                "reading_order_file": "",
                 "meta_file": "",
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
@@ -319,22 +396,21 @@ def worker(task):
                 text, tsv, actual_mp = ocr_page(
                     page, cfg["dpi"], cfg["lang"], cfg["psm"], cfg["timeout"]
                 )
+                reading_order, line_count = reading_order_from_tsv(tsv)
                 row.update({
                     "megapixels": round(actual_mp, 2),
                     "chars": len(text),
-                    "tsv_words": count_tsv_words(tsv),
+                    "tsv_words": len(parse_tsv_words(tsv)),
+                    "reading_order_lines": line_count,
                     "seconds": round(time.time() - t0, 2),
                 })
                 if len(text) < cfg["min_chars"]:
-                    row.update({
-                        "status": "low_text",
-                        "reason": f"распознано только {len(text)} символов",
-                    })
+                    row.update({"status": "low_text", "reason": f"распознано только {len(text)} символов"})
                     outcome["low"] += 1
                 else:
                     row["status"] = "ok"
                     outcome["ok"] += 1
-                write_page_files(ocr_dir, row, text, tsv)
+                write_page_files(ocr_dir, row, text, tsv, reading_order)
             except RuntimeError as exc:
                 message = str(exc)
                 row.update({
@@ -367,7 +443,7 @@ def worker(task):
             "low_text_this_run": outcome["low"],
             "skipped_too_large_this_run": outcome["large"],
             "errors_this_run": outcome["errors"],
-            "settings": {k: v for k, v in cfg.items() if k != "tesseract"},
+            "settings": {key: value for key, value in cfg.items() if key != "tesseract"},
         }
         (out_folder / "ocr_quality_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -375,8 +451,7 @@ def worker(task):
         return outcome
     except Exception as exc:
         outcome.update({
-            "status": "error",
-            "errors": outcome["errors"] + 1,
+            "status": "error", "errors": outcome["errors"] + 1,
             "reason": f"worker: {type(exc).__name__}: {exc}",
         })
         return outcome
@@ -386,22 +461,22 @@ def worker(task):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Качественный OCR БТИ-PDF: 350 DPI + мягкая обработка + пропуск больших листов."
+        description="Качественный OCR БТИ: PSM 11, TSV, reading order и пропуск больших листов."
     )
     ap.add_argument("--csv", required=True, help="CSV с колонкой «путь»")
     ap.add_argument("--path-column", default="путь")
     ap.add_argument("--sep", default=",")
-    ap.add_argument("--dump-root", required=True, help="Папка с результатами первого native-дампа")
+    ap.add_argument("--dump-root", required=True, help="Папка результатов native-дампа")
     ap.add_argument("--workers", type=int, default=2, help="Одновременные PDF; для 350 DPI начать с 2")
-    ap.add_argument("--dpi", type=int, default=350, help="350 по умолчанию: мелкие цифры площадей")
-    ap.add_argument("--max-megapixels", type=float, default=20.0, help="Пропустить лист, если рендер больше этого лимита")
+    ap.add_argument("--dpi", type=int, default=350)
+    ap.add_argument("--max-megapixels", type=float, default=20.0)
     ap.add_argument("--ocr-lang", default="rus+eng")
-    ap.add_argument("--ocr-psm", type=int, default=6)
-    ap.add_argument("--timeout", type=int, default=120, help="Максимум секунд на лист")
+    ap.add_argument("--ocr-psm", type=int, default=11, help="PSM 11 по умолчанию: максимальная полнота OCR")
+    ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--min-chars", type=int, default=15)
     ap.add_argument("--retry-failed", action="store_true")
-    ap.add_argument("--overwrite", action="store_true", help="Перераспознать всё, игнорируя кеш")
-    ap.add_argument("--force-pages", default="", help="Страницы через запятую, например 17,18; обрабатываются даже сверх лимита")
+    ap.add_argument("--overwrite", action="store_true", help="Перераспознать все страницы, игнорируя кеш")
+    ap.add_argument("--force-pages", default="", help="Страницы через запятую; OCR даже сверх лимита MP")
     ap.add_argument("--tesseract-cmd", default=None)
     args = ap.parse_args()
 
@@ -414,7 +489,7 @@ def main():
     if args.max_megapixels <= 0:
         raise SystemExit("--max-megapixels должен быть больше 0")
     try:
-        force_pages = sorted({int(x.strip()) for x in args.force_pages.split(",") if x.strip()})
+        force_pages = sorted({int(part.strip()) for part in args.force_pages.split(",") if part.strip()})
     except ValueError:
         raise SystemExit("--force-pages: номера страниц через запятую, например 17,18")
 
@@ -459,7 +534,7 @@ def main():
         writer.writeheader()
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             futures = [pool.submit(worker, task) for task in tasks]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Quality OCR", unit="pdf"):
+            for future in tqdm(as_completed(futures), total=len(futures), desc="BTI OCR", unit="pdf"):
                 try:
                     result = future.result()
                 except Exception as exc:
