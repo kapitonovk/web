@@ -1,36 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Полный image-debug Tesseract для БТИ-сканов.
+Тестовый OCR-дампер БТИ: raw grayscale + встроенный Adaptive Otsu Tesseract + PSM 11.
 
-Каждая из первых N страниц КАЖДОГО PDF тестируется во ВСЕХ вариантах
-изображения при одинаковых настройках OCR: rus, PSM 11.
+Для первых 40 страниц каждого PDF из CSV (колонка «путь») сохраняет:
+  render.png       — исходный grayscale-рендер PDF
+  prepared.png     — изображение, поданное Tesseract (то же raw grayscale)
+  tessinput.tif    — внутренний thresholded bitmap Tesseract, если сборка его отдаёт
+  result.tsv       — слова, координаты, confidence
+  text.txt         — сырой plain text Tesseract
+  page_order.txt   — пространственная текстовая имитация страницы по TSV
+  meta.json        — параметры, размеры, время и базовые метрики
 
-Варианты:
-  1. base            Исходный grayscale 400 DPI, без нашей обработки.
-  2. contrast        Autocontrast + сильный contrast 2.6.
-  3. invert          Инверсия -> autocontrast + contrast 2.6.
-  4. invert_back     Обработка в инверсной полярности -> инверсия обратно.
-                      Это оставляет Tesseract тёмный текст на светлом фоне.
-  5. tess_sauvola    Исходный grayscale; встроенная Sauvola binarization
-                      Tesseract.
-  6. tess_otsu       Исходный grayscale; встроенная Adaptive Otsu
-                      Tesseract.
-
-Для каждого варианта сохраняются:
-  render.png          исходный grayscale рендер PDF
-  prepared.png        изображение, переданное в Tesseract
-  text.txt            plain text
-  result.tsv          слова + координаты + confidence
-  meta.json           конфигурация, время, метрики
-  tessinput.tif       внутренний thresholded bitmap Tesseract, если удалось
-
-ВАЖНО: tessinput.tif создаётся Tesseract в рабочей папке процесса. Скрипт
-запускает OCR-вызовы последовательно и переносит созданный tif в папку
-соответствующего варианта. В некоторых сборках Tesseract файл может не
-создаваться; тогда это отмечается в meta.json.
-
-Вход: CSV с колонкой «путь».
+Настройки намеренно фиксированы:
+  - 400 DPI
+  - rus
+  - PSM 11
+  - raw grayscale без нашей обработки
+  - Tesseract Adaptive Otsu: thresholding_method=1
+  - без вращения и без контентных эвристик
 
 Зависимости:
   py -m pip install pymupdf pytesseract pillow tqdm
@@ -40,16 +28,21 @@ Tesseract рядом со скриптом:
   .\tesseract\tessdata\rus.traineddata
 
 Пример:
-  py bti_ocr_image_debug.py --csv test_two_pdfs.csv --sep ";" --outdir ocr_image_debug
+  py bti_ocr_image_debug.py --csv test_two_pdfs.csv --sep ";" --outdir ocr_otsu_test
+
+Повторить поверх существующих результатов:
+  py bti_ocr_image_debug.py --csv test_two_pdfs.csv --sep ";" --outdir ocr_otsu_test --overwrite
 """
 
 import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
+import statistics
 import tempfile
 import time
 import unicodedata
@@ -61,7 +54,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import fitz
 import pytesseract
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image
 
 try:
     from tqdm import tqdm
@@ -70,44 +63,11 @@ except ImportError:
         return items
 
 
-VARIANTS = [
-    {
-        "id": "01_base",
-        "label": "raw grayscale: no preprocessing",
-        "prepare": "base",
-        "tess_config": "",
-    },
-    {
-        "id": "02_contrast",
-        "label": "autocontrast + strong contrast 2.6",
-        "prepare": "contrast",
-        "tess_config": "",
-    },
-    {
-        "id": "03_invert",
-        "label": "invert -> autocontrast + strong contrast 2.6 (white text on black)",
-        "prepare": "invert",
-        "tess_config": "",
-    },
-    {
-        "id": "04_invert_back",
-        "label": "invert -> enhance -> invert back (dark text on light)",
-        "prepare": "invert_back",
-        "tess_config": "",
-    },
-    {
-        "id": "05_tess_sauvola",
-        "label": "raw grayscale + Tesseract Sauvola thresholding",
-        "prepare": "base",
-        "tess_config": "-c thresholding_method=2 -c thresholding_window_size=0.33 -c thresholding_kfactor=0.34",
-    },
-    {
-        "id": "06_tess_otsu",
-        "label": "raw grayscale + Tesseract Adaptive Otsu thresholding",
-        "prepare": "base",
-        "tess_config": "-c thresholding_method=1",
-    },
-]
+DPI = 400
+PSM = 11
+LANG = "rus"
+PAGES_PER_PDF = 40
+TESS_CONFIG = "--oem 1 --psm 11 -c preserve_interword_spaces=1 -c tessedit_write_images=1 -c thresholding_method=1"
 
 
 def safe_name(text):
@@ -156,7 +116,7 @@ def find_tesseract(script_dir, supplied):
     return None
 
 
-def validate_tesseract(exe, lang):
+def validate_tesseract(exe):
     if not exe:
         raise SystemExit("Tesseract не найден. Нужен .\\tesseract\\tesseract.exe или --tesseract-cmd.")
     pytesseract.pytesseract.tesseract_cmd = str(exe)
@@ -167,12 +127,12 @@ def validate_tesseract(exe, lang):
         languages = set(pytesseract.get_languages(config=""))
     except Exception as exc:
         raise SystemExit(f"Не удалось запустить Tesseract: {exc}")
-    if lang not in languages:
-        raise SystemExit(f"В Tesseract нет языка: {lang}")
+    if LANG not in languages:
+        raise SystemExit("В Tesseract нет rus.traineddata")
 
 
-def render_page(page, dpi):
-    scale = dpi / 72
+def render_page(page):
+    scale = DPI / 72
     pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csGRAY, alpha=False)
     try:
         return Image.frombytes("L", [pix.width, pix.height], pix.samples)
@@ -180,112 +140,133 @@ def render_page(page, dpi):
         pix = None
 
 
-def strong_contrast(image):
-    image = ImageOps.autocontrast(image, cutoff=0.5)
-    return ImageEnhance.Contrast(image).enhance(2.6)
-
-
-def prepare_image(raw, method):
-    if method == "base":
-        return raw.copy()
-    if method == "contrast":
-        return strong_contrast(raw)
-    if method == "invert":
-        inverted = ImageOps.invert(raw)
-        try:
-            return strong_contrast(inverted)
-        finally:
-            inverted.close()
-    if method == "invert_back":
-        inverted = ImageOps.invert(raw)
-        try:
-            enhanced = strong_contrast(inverted)
-        finally:
-            inverted.close()
-        try:
-            return ImageOps.invert(enhanced)
-        finally:
-            enhanced.close()
-    raise ValueError(f"Unknown prepare mode: {method}")
-
-
-def count_tsv(tsv):
-    word_count = digit_words = numeric_like = 0
-    reader = csv.DictReader(tsv.splitlines(), delimiter="\t")
-    for row in reader:
-        text = (row.get("text") or "").strip()
-        if row.get("level") != "5" or not text:
-            continue
-        word_count += 1
-        if re.search(r"\d", text):
-            digit_words += 1
-        if re.fullmatch(r"[0-9OОЗЗбБIlІl.,:;\-]+", text):
-            numeric_like += 1
-    return word_count, digit_words, numeric_like
-
-
-def move_tessinput(workdir, variant_dir):
-    """Переносит thresholded-image, если сборка Tesseract его создала."""
+def move_tessinput(workdir, page_dir):
     candidates = list(workdir.glob("tessinput.*")) + list(workdir.glob("*.processed.tif"))
     if not candidates:
         return ""
-    src = max(candidates, key=lambda p: p.stat().st_mtime)
-    suffix = src.suffix or ".tif"
-    dest = variant_dir / f"tessinput{suffix}"
-    shutil.move(str(src), str(dest))
-    return dest.name
+    source = max(candidates, key=lambda path: path.stat().st_mtime)
+    target = page_dir / f"tessinput{source.suffix or '.tif'}"
+    shutil.move(str(source), str(target))
+    return target.name
 
 
-def run_variant(page, raw, variant, args, page_dir):
+def parse_tsv_words(tsv):
+    reader = csv.DictReader(tsv.splitlines(), delimiter="\t")
+    words = []
+    for row in reader:
+        text = (row.get("text") or "").strip()
+        if not text or row.get("level") != "5":
+            continue
+        try:
+            left = int(row.get("left", "0"))
+            top = int(row.get("top", "0"))
+            width = int(row.get("width", "0"))
+            height = int(row.get("height", "0"))
+        except ValueError:
+            continue
+        words.append({
+            "text": text,
+            "left": left,
+            "top": top,
+            "right": left + width,
+            "bottom": top + height,
+            "height": height,
+        })
+    return words
+
+
+def render_page_order(tsv, page_width, page_height, columns=140, vertical_scale=1.8):
+    """Моноширинная пространственная реконструкция: сохраняет X/Y-положение слов."""
+    words = parse_tsv_words(tsv)
+    if not words:
+        return "[В TSV нет распознанных слов]\n"
+    columns = max(columns, 40)
+    char_px = max(1.0, page_width / columns)
+    row_px = max(1.0, char_px * vertical_scale)
+    rows = max(1, math.ceil(page_height / row_px) + 1)
+    canvas = [[] for _ in range(rows)]
+    for word in sorted(words, key=lambda w: (w["top"], w["left"])):
+        row = min(rows - 1, max(0, int(word["top"] / row_px)))
+        col = min(columns - 1, max(0, int(word["left"] / char_px)))
+        canvas[row].append((col, word["text"]))
+    output = []
+    previous_nonempty = None
+    for row_no, items in enumerate(canvas):
+        if not items:
+            continue
+        if previous_nonempty is not None:
+            output.extend([""] * min(3, max(0, row_no - previous_nonempty - 1)))
+        cursor = 0
+        fragments = []
+        for col, text in sorted(items, key=lambda item: item[0]):
+            col = max(col, cursor + (1 if fragments else 0))
+            if col > cursor:
+                fragments.append(" " * (col - cursor))
+                cursor = col
+            fragments.append(text)
+            cursor += len(text)
+        output.append("".join(fragments).rstrip())
+        previous_nonempty = row_no
+    return "\n".join(output).rstrip() + "\n"
+
+
+def count_metrics(text, tsv):
+    rows = list(csv.DictReader(tsv.splitlines(), delimiter="\t"))
+    words = [row for row in rows if row.get("level") == "5" and (row.get("text") or "").strip()]
+    digit_words = [row for row in words if re.search(r"\d", row.get("text") or "")]
+    return {
+        "chars": len(text),
+        "digits": len(re.findall(r"\d", text)),
+        "commas_dots": len(re.findall(r"[,.]", text)),
+        "tsv_words": len(words),
+        "tsv_digit_words": len(digit_words),
+    }
+
+
+def process_page(page, page_dir, args):
     page_dir.mkdir(parents=True, exist_ok=True)
-    render_path = page_dir / "render.png"
-    raw.save(render_path)
-    prepared = prepare_image(raw, variant["prepare"])
+    raw = render_page(page)
     try:
-        prepared.save(page_dir / "prepared.png")
-        config = (
-            f"--oem 1 --psm {args.ocr_psm} "
-            f"-c preserve_interword_spaces=1 "
-            f"-c tessedit_write_images=1 "
-            f"{variant['tess_config']}"
-        )
-        with tempfile.TemporaryDirectory(prefix="bti_tess_") as temp:
+        raw.save(page_dir / "render.png")
+        # В этом режиме prepared и render намеренно одинаковы.
+        raw.save(page_dir / "prepared.png")
+        with tempfile.TemporaryDirectory(prefix="bti_otsu_") as temp:
             workdir = Path(temp)
             previous = Path.cwd()
             try:
                 os.chdir(workdir)
-                t0 = time.time()
-                text = pytesseract.image_to_string(prepared, lang=args.ocr_lang, config=config, timeout=args.timeout)
-                tsv = pytesseract.image_to_data(prepared, lang=args.ocr_lang, config=config, timeout=args.timeout, output_type=pytesseract.Output.STRING)
-                elapsed = time.time() - t0
-                tessinput_file = move_tessinput(workdir, page_dir)
+                started = time.time()
+                text = pytesseract.image_to_string(raw, lang=LANG, config=TESS_CONFIG, timeout=args.timeout)
+                tsv = pytesseract.image_to_data(raw, lang=LANG, config=TESS_CONFIG, timeout=args.timeout, output_type=pytesseract.Output.STRING)
+                seconds = time.time() - started
+                tessinput = move_tessinput(workdir, page_dir)
             finally:
                 os.chdir(previous)
         text = norm_text(text)
         (page_dir / "text.txt").write_text(text, encoding="utf-8")
         (page_dir / "result.tsv").write_text(tsv, encoding="utf-8")
-        words, digit_words, numeric_like = count_tsv(tsv)
+        page_order = render_page_order(tsv, raw.width, raw.height)
+        (page_dir / "page_order.txt").write_text(page_order, encoding="utf-8")
+        metrics = count_metrics(text, tsv)
         meta = {
             "page": page.number + 1,
-            "variant": variant,
-            "ocr_lang": args.ocr_lang,
-            "ocr_psm": args.ocr_psm,
+            "ocr_lang": LANG,
+            "ocr_psm": PSM,
+            "dpi": DPI,
+            "preprocessing": "raw_grayscale",
+            "tesseract_thresholding": "adaptive_otsu (thresholding_method=1)",
+            "tesseract_config": TESS_CONFIG,
             "page_size_pt": {"width": page.rect.width, "height": page.rect.height},
-            "render_size_px": {"width": prepared.width, "height": prepared.height},
-            "megapixels": round((prepared.width * prepared.height) / 1_000_000, 2),
-            "seconds": round(elapsed, 2),
-            "chars": len(text),
-            "digits": len(re.findall(r"\d", text)),
-            "commas_dots": len(re.findall(r"[,.]", text)),
-            "tsv_words": words,
-            "tsv_digit_words": digit_words,
-            "tsv_numeric_like_words": numeric_like,
-            "tessinput_file": tessinput_file,
+            "render_size_px": {"width": raw.width, "height": raw.height},
+            "megapixels": round((raw.width * raw.height) / 1_000_000, 2),
+            "seconds": round(seconds, 2),
+            "tessinput_file": tessinput,
+            **metrics,
         }
         (page_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         return {"status": "ok", **meta}
     finally:
-        prepared.close()
+        raw.close()
 
 
 def process_pdf(pdf_path, outdir, args):
@@ -296,11 +277,8 @@ def process_pdf(pdf_path, outdir, args):
     manifest = {
         "source_pdf": str(pdf_path),
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "variants": VARIANTS,
+        "mode": "raw_grayscale + adaptive_otsu + psm11",
         "pages_per_pdf": args.pages_per_pdf,
-        "dpi": args.dpi,
-        "psm": args.ocr_psm,
-        "language": args.ocr_lang,
         "status": "error",
     }
     if not pdf_path.is_file():
@@ -316,32 +294,23 @@ def process_pdf(pdf_path, outdir, args):
     try:
         limit = min(args.pages_per_pdf, doc.page_count)
         for page_idx in range(limit):
-            page = doc.load_page(page_idx)
-            raw = render_page(page, args.dpi)
+            page_dir = pages_dir / f"page_{page_idx+1:04d}"
+            meta_path = page_dir / "meta.json"
+            if meta_path.is_file() and not args.overwrite:
+                try:
+                    old = json.loads(meta_path.read_text(encoding="utf-8"))
+                    results.append({"source_pdf": str(pdf_path), "page": page_idx + 1, "status": "skipped_existing", **old})
+                    continue
+                except Exception:
+                    pass
             try:
-                for variant in VARIANTS:
-                    variant_dir = pages_dir / f"page_{page_idx+1:04d}" / variant["id"]
-                    if (variant_dir / "meta.json").is_file() and not args.overwrite:
-                        try:
-                            old = json.loads((variant_dir / "meta.json").read_text(encoding="utf-8"))
-                            results.append({"source_pdf": str(pdf_path), "page": page_idx + 1, "variant": variant["id"], "status": "skipped_existing", **old})
-                            continue
-                        except Exception:
-                            pass
-                    try:
-                        result = run_variant(page, raw, variant, args, variant_dir)
-                        results.append({"source_pdf": str(pdf_path), "page": page_idx + 1, "variant": variant["id"], **result})
-                    except Exception as exc:
-                        variant_dir.mkdir(parents=True, exist_ok=True)
-                        error = {
-                            "source_pdf": str(pdf_path), "page": page_idx + 1,
-                            "variant": variant["id"], "status": "error",
-                            "reason": f"{type(exc).__name__}: {exc}",
-                        }
-                        (variant_dir / "meta.json").write_text(json.dumps(error, ensure_ascii=False, indent=2), encoding="utf-8")
-                        results.append(error)
-            finally:
-                raw.close()
+                result = process_page(doc.load_page(page_idx), page_dir, args)
+                results.append({"source_pdf": str(pdf_path), "page": page_idx + 1, **result})
+            except Exception as exc:
+                page_dir.mkdir(parents=True, exist_ok=True)
+                error = {"source_pdf": str(pdf_path), "page": page_idx + 1, "status": "error", "reason": f"{type(exc).__name__}: {exc}"}
+                meta_path.write_text(json.dumps(error, ensure_ascii=False, indent=2), encoding="utf-8")
+                results.append(error)
         manifest.update({"status": "ok", "page_count": doc.page_count, "processed_pages": limit})
         (pdf_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return results
@@ -350,15 +319,12 @@ def process_pdf(pdf_path, outdir, args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Тест всех image-preprocessing вариантов на первых 10 страницах БТИ-PDF.")
+    ap = argparse.ArgumentParser(description="Тестовый БТИ OCR: raw grayscale + Otsu + PSM 11, первые 40 страниц PDF.")
     ap.add_argument("--csv", required=True, help="CSV с колонкой «путь»")
     ap.add_argument("--path-column", default="путь")
     ap.add_argument("--sep", default=",")
-    ap.add_argument("--outdir", default="ocr_image_debug")
-    ap.add_argument("--pages-per-pdf", type=int, default=10, help="По умолчанию первые 10 страниц каждого PDF")
-    ap.add_argument("--dpi", type=int, default=400)
-    ap.add_argument("--ocr-lang", default="rus")
-    ap.add_argument("--ocr-psm", type=int, default=11)
+    ap.add_argument("--outdir", default="ocr_otsu_test")
+    ap.add_argument("--pages-per-pdf", type=int, default=PAGES_PER_PDF, help="По умолчанию 40")
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--tesseract-cmd", default=None)
@@ -368,8 +334,6 @@ def main():
         raise SystemExit("--sep должен быть одним символом")
     if args.pages_per_pdf < 1:
         raise SystemExit("--pages-per-pdf должен быть не меньше 1")
-    if args.dpi < 200:
-        raise SystemExit("--dpi слишком низкий для диагностического теста")
     csv_path = Path(args.csv)
     if not csv_path.is_file():
         raise SystemExit(f"Нет CSV: {csv_path}")
@@ -378,27 +342,22 @@ def main():
         raise SystemExit("В CSV нет непустых путей")
 
     tesseract = find_tesseract(Path(__file__).resolve().parent, args.tesseract_cmd)
-    validate_tesseract(tesseract, args.ocr_lang)
+    validate_tesseract(tesseract)
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     all_results = []
-    for pdf_path in tqdm(paths, desc="OCR image debug", unit="pdf"):
+    for pdf_path in tqdm(paths, desc="Otsu OCR test", unit="pdf"):
         all_results.extend(process_pdf(pdf_path, outdir, args))
 
     summary_path = outdir / "summary.csv"
-    fields = [
-        "source_pdf", "page", "variant", "status", "chars", "digits", "commas_dots",
-        "tsv_words", "tsv_digit_words", "tsv_numeric_like_words", "seconds", "megapixels",
-        "tessinput_file", "reason",
-    ]
+    fields = ["source_pdf", "page", "status", "chars", "digits", "commas_dots", "tsv_words", "tsv_digit_words", "seconds", "megapixels", "tessinput_file", "reason"]
     with summary_path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(all_results)
-
     print(f"Готово: {summary_path}")
-    print("Для каждой страницы и варианта сохранены render.png, prepared.png, text.txt, result.tsv, meta.json и (если Tesseract отдал) tessinput.tif.")
+    print("На страницу: render.png, prepared.png, result.tsv, text.txt, page_order.txt, meta.json и (если доступен) tessinput.tif.")
 
 
 if __name__ == "__main__":
